@@ -1,15 +1,13 @@
 package client
 
 import (
+	"net"
 	"redis/interface/resp"
 	"redis/lib/logger"
 	"redis/lib/sync/wait"
 	"redis/resp/parser"
 	"redis/resp/reply"
-
-	"net"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"time"
 )
@@ -70,7 +68,6 @@ func (client *Client) Start() {
 
 // Close stops asynchronous goroutines and close connection
 func (client *Client) Close() {
-
 	client.ticker.Stop()
 	// stop new request
 	close(client.pendingReqs)
@@ -82,7 +79,8 @@ func (client *Client) Close() {
 	_ = client.conn.Close()
 	close(client.waitingReqs)
 }
-func (client *Client) handleConnectionError() error {
+
+func (client *Client) handleConnectionError(err error) error {
 	err1 := client.conn.Close()
 	if err1 != nil {
 		if opErr, ok := err1.(*net.OpError); ok {
@@ -119,7 +117,6 @@ func (client *Client) handleWrite() {
 
 // Send sends a request to redis server
 func (client *Client) Send(args [][]byte) resp.Reply {
-
 	request := &request{
 		args:      args,
 		heartbeat: false,
@@ -158,14 +155,14 @@ func (client *Client) doRequest(req *request) {
 	}
 	re := reply.MakeMultiBulkReply(req.args)
 	bytes := re.ToBytes()
-	var err error
-	for i := 0; i < 3; i++ { // only retry, waiting for handleRead
-		_, err = client.conn.Write(bytes)
-		if err == nil ||
-			(!strings.Contains(err.Error(), "timeout") && // only retry timeout
-				!strings.Contains(err.Error(), "deadline exceeded")) {
-			break
+	_, err := client.conn.Write(bytes)
+	i := 0
+	for err != nil && i < 3 {
+		err = client.handleConnectionError(err)
+		if err == nil {
+			_, err = client.conn.Write(bytes)
 		}
+		i++
 	}
 	if err == nil {
 		client.waitingReqs <- req
@@ -196,7 +193,8 @@ func (client *Client) handleRead() error {
 	ch := parser.ParseStream(client.conn)
 	for payload := range ch {
 		if payload.Err != nil {
-			return payload.Err
+			client.finishRequest(reply.MakeErrReply(payload.Err.Error()))
+			continue
 		}
 		client.finishRequest(payload.Data)
 	}
